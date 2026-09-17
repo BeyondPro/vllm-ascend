@@ -941,6 +941,162 @@ class SchedulerConfig:
         return default
 
 
+class CpuMoeConfig:
+    """
+    Configuration Object for expert_offload_config.cpu_moe from additional_config
+
+    Selects which MoE layers get a kt-kernel CPU routed-expert backend attached
+    at model-load time.  ``enabled=False`` (the default) leaves the existing
+    weight-paging offload path completely untouched: no backend is constructed,
+    no GGUF is opened, and ``get_hybrid_expert_executor()`` keeps returning
+    ``None`` for every layer.
+
+    The indices in ``layers`` are MODEL layer indices -- the same namespace as
+    the GGUF ``blk.{layer_idx}`` prefix -- NOT the MoE registration ordinal that
+    ``num_device_experts`` and the other per-layer offload arrays use.
+    """
+
+    _defaults = {
+        "enabled": False,
+        # Only the ktransformers LLAMAFILE MoE wrapper is implemented today.
+        "backend": "kt_kernel",
+        # Per-layer GGUF template, literal or containing "{layer_idx}".
+        # Expanded per layer by KtKernelBackendConfig.resolved_weight_path().
+        "weight_path": "",
+        # "all", or an explicit list of MODEL layer indices.
+        "layers": "all",
+        "cpuinfer_threads": 32,
+        # Each thread pool is bound to one NUMA node, so this must not exceed
+        # the host NUMA node count.
+        "threadpool_count": 1,
+        "max_num_tokens": 1,
+        "numa_nodes": None,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        self.config = self._defaults.copy()
+        if user_config is not None and not isinstance(user_config, dict):
+            raise TypeError(
+                "expert_offload_config.cpu_moe must be a dict; got "
+                f"{type(user_config).__name__}")
+        if user_config:
+            for key, value in user_config.items():
+                if key in self.config:
+                    self.config[key] = value
+                else:
+                    raise ValueError(f"Config has no attribute '{key}'")
+        self.config["layers"] = self._normalize_layers(self.config["layers"])
+        self.config["numa_nodes"] = self._normalize_numa_nodes(
+            self.config["numa_nodes"])
+        self._validate_config()
+
+    def __getattr__(self, key):
+        if key in self.config:
+            return self.config[key]
+        raise AttributeError(f"Config has no attribute '{key}'")
+
+    @staticmethod
+    def _normalize_layers(value):
+        """Return "all" or a sorted tuple of unique model layer indices.
+
+        ``None`` means "all", matching a config that omits the key entirely.
+        """
+        if value is None or value == "all":
+            return "all"
+        if isinstance(value, str):
+            raise ValueError(
+                "cpu_moe.layers must be 'all' or a list of model layer "
+                f"indices; got {value!r}")
+        if isinstance(value, (list, tuple)):
+            if not value:
+                raise ValueError(
+                    "cpu_moe.layers must not be empty; use 'all' to select "
+                    "every MoE layer")
+            indices: set[int] = set()
+            for item in value:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise TypeError(
+                        "cpu_moe.layers entries must be integers; got "
+                        f"{item!r}")
+                if item < 0:
+                    raise ValueError(
+                        f"cpu_moe.layers entries must be >= 0; got {item}")
+                indices.add(item)
+            return tuple(sorted(indices))
+        raise TypeError(
+            "cpu_moe.layers must be 'all' or a list of model layer indices; "
+            f"got {type(value).__name__}")
+
+    @staticmethod
+    def _normalize_numa_nodes(value):
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(
+                "cpu_moe.numa_nodes must be null or a list of node ids; got "
+                f"{type(value).__name__}")
+        nodes: list[int] = []
+        for node in value:
+            if isinstance(node, bool) or not isinstance(node, int):
+                raise TypeError(
+                    "cpu_moe.numa_nodes entries must be integers; got "
+                    f"{node!r}")
+            if node < 0:
+                raise ValueError(
+                    f"cpu_moe.numa_nodes entries must be >= 0; got {node}")
+            nodes.append(node)
+        return tuple(nodes)
+
+    def includes(self, model_layer_idx: int) -> bool:
+        """Whether hybrid execution is on AND this MODEL layer is selected."""
+        if not self.config["enabled"]:
+            return False
+        if self.layers == "all":
+            return True
+        return model_layer_idx in self.layers
+
+    def _validate_config(self):
+        if not isinstance(self.config["enabled"], bool):
+            raise TypeError("cpu_moe.enabled must be a boolean")
+        if self.config["backend"] not in ("kt_kernel", ):
+            raise ValueError("cpu_moe.backend must be 'kt_kernel'; got "
+                             f"{self.config['backend']!r}")
+        if not isinstance(self.config["weight_path"], str):
+            raise TypeError("cpu_moe.weight_path must be a string")
+        for key in ("cpuinfer_threads", "threadpool_count", "max_num_tokens"):
+            value = self.config[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"cpu_moe.{key} must be an integer")
+            if value <= 0:
+                raise ValueError(f"cpu_moe.{key} must be positive; got {value}")
+        numa_nodes = self.config["numa_nodes"]
+        if numa_nodes is not None and len(
+                numa_nodes) != self.config["threadpool_count"]:
+            raise ValueError(
+                "cpu_moe.numa_nodes must contain one node per thread pool; "
+                f"got nodes={len(numa_nodes)}, "
+                f"threadpool_count={self.config['threadpool_count']}")
+        # Everything below only matters once the user opts in: a disabled
+        # sub-config must never reject an otherwise-valid expert_offload_config.
+        if not self.config["enabled"]:
+            return
+        weight_path = self.config["weight_path"]
+        if not weight_path:
+            raise ValueError(
+                "cpu_moe.weight_path must not be empty when "
+                "cpu_moe.enabled=True")
+        # A template without {layer_idx} would load ONE layer's GGUF into every
+        # selected layer -- silently wrong numerics, so reject it whenever more
+        # than one layer can be selected. A literal path is fine for a
+        # single-element list.
+        multiple = self.layers == "all" or len(self.layers) > 1
+        if multiple and "{layer_idx}" not in weight_path:
+            raise ValueError(
+                "cpu_moe.weight_path must contain the '{layer_idx}' "
+                "placeholder when cpu_moe.layers selects more than one layer; "
+                f"got {weight_path!r}")
+
+
 class ExpertOffloadConfig:
     """
     Configuration Object for expert_offload_config from additional_config
@@ -1000,11 +1156,19 @@ class ExpertOffloadConfig:
         self._hot_experts_cache: dict[str, Any] | None = None
         if user_config and isinstance(user_config, dict):
             for key, value in user_config.items():
+                if key == "cpu_moe":
+                    # Nested sub-config, built below. Deliberately not stored
+                    # in self.config so that self.cpu_moe is a real attribute
+                    # and shadows __getattr__.
+                    continue
                 if key in self.config:
                     self.config[key] = value
                 else:
                     raise ValueError(f"Config has no attribute '{key}'")
 
+        self.cpu_moe = CpuMoeConfig(
+            user_config.get("cpu_moe")
+            if isinstance(user_config, dict) else None)
         self._validate_config()
 
     def __getattr__(self, key):
@@ -1349,6 +1513,12 @@ class ExpertOffloadConfig:
             raise TypeError("expert_substitution_threshold must be a number")
         if self.config["expert_substitution_threshold"] < 0:
             raise ValueError("expert_substitution_threshold must be >= 0")
+        if self.cpu_moe.enabled and not self.config["expert_offload"]:
+            raise ValueError(
+                "expert_offload_config.cpu_moe.enabled=True requires "
+                "expert_offload_config.expert_offload=True: the hybrid CPU "
+                "branch replaces the paging path inside the offload hooks, "
+                "which are never entered when expert offload is off")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

@@ -230,11 +230,33 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
         prefill_slot = -1
+        cpu_expert_task = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
-            if getattr(layer, 'enable_multi_card', False):
+            # Hybrid execution owns this layer's placement.  Paging it would
+            # rewrite the very log2phy the CPU/NPU split is derived from, so
+            # the two halves could disagree about who owns a route.
+            hybrid_plan = None
+            if not getattr(layer, 'enable_multi_card', False):
+                from vllm_ascend.expert_offload.hybrid_executor import (
+                    maybe_prepare_hybrid_routes,
+                )
+
+                hybrid_plan = maybe_prepare_hybrid_routes(
+                    layer,
+                    hidden_states=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    log2phy=log2phy,
+                    max_tokens=mgr.offload_threshold,
+                )
+            if hybrid_plan is not None:
+                topk_ids = hybrid_plan.npu_topk_ids
+                topk_weights = hybrid_plan.npu_topk_weights
+                cpu_expert_task = hybrid_plan.cpu_task
+            elif getattr(layer, 'enable_multi_card', False):
                 mgr.update_weights_multi_card(
                     layer, topk_ids, log2phy, topk_weights,
                     hidden_states=x, mc2_mask=mc2_mask,
@@ -392,6 +414,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             layer.moe_config.num_local_experts = _saved_nle
             layer.local_num_experts = _saved_lne
             moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
+        if cpu_expert_task is not None:
+            final_hidden_states.cpu_expert_task = cpu_expert_task
         return final_hidden_states
 
 
@@ -733,6 +757,25 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             from vllm_ascend.expert_offload import ExpertOffloadManager
             ExpertOffloadManager.get_instance().init_layer_cpu_buffers(
                 self.routed_experts, self.moe_instance_id)
+            # CPU/NPU hybrid: hand this layer to a kt-kernel CPU backend when
+            # cpu_moe selects it.  Ordered after the resident map is final --
+            # the executor derives its per-step route split from log2phy, so
+            # attaching earlier would let paging install a different resident
+            # set than the one the executor later reads.
+            from vllm_ascend.expert_offload.cpu_backend.wiring import (
+                maybe_attach_cpu_expert_backend,
+            )
+
+            maybe_attach_cpu_expert_backend(
+                routed_experts=self.routed_experts,
+                # MoERunner keeps no layer_name of its own; RoutedExperts
+                # received the same string from the factory.
+                layer_name=self.routed_experts.layer_name,
+                moe_config=self.moe_config,
+                cpu_moe_config=_offload_cfg.cpu_moe,
+                enable_multi_card=self.enable_multi_card,
+                tp_size=vllm_config.parallel_config.tensor_parallel_size,
+            )
 
         # Register this MoE layer with EPLB for PP compatibility.
         # PPMissingLayer (nn.Identity) never calls AscendFusedMoE.__init__,
@@ -1083,8 +1126,18 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             else:
                 self.moe_load.add_(local_load)
 
+        routed_hidden_states = fused_experts_results.routed_out
+        cpu_expert_task = fused_experts_results.cpu_expert_task
+        if cpu_expert_task is not None:
+            from vllm_ascend.expert_offload.hybrid_executor import (
+                HybridExpertExecutor,
+            )
+
+            routed_hidden_states = HybridExpertExecutor.finish(
+                routed_hidden_states, cpu_expert_task)
+
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
-            hidden_states=fused_experts_results.routed_out,
+            hidden_states=routed_hidden_states,
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )

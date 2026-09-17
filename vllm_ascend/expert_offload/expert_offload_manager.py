@@ -5977,11 +5977,22 @@ class ExpertOffloadManager:
         next_idx = layer_idx + 1
         if next_idx >= len(self.moe_layers) - 1:
             return None
+        next_layer = self.moe_layers[next_idx]
+        # Guard the layer being prefetched, not the one calling: prefetch
+        # loads the *next* layer's experts, and a mixed run can have a hybrid
+        # layer on either side of a purely-NPU one.  A hybrid layer's NPU
+        # resident set is fixed for the whole run, so there is nothing to page
+        # in -- paging would also rewrite the log2phy its split derives from.
+        # Bailing here also skips the gate prediction below.
+        from vllm_ascend.expert_offload.hybrid_executor import (
+            get_hybrid_expert_executor,
+        )
+        if get_hybrid_expert_executor(next_layer) is not None:
+            return None
         predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:
             return None
         topk_weights, topk_ids = predicted
-        next_layer = self.moe_layers[next_idx]
         num_tokens = topk_ids.size(0)
         topk_ids_h = self.topk_ids_h[:num_tokens]
         topk_ids_h.copy_(topk_ids.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)

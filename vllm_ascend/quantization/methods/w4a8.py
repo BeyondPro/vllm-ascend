@@ -569,12 +569,34 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         # resident on NPU when offload is enabled).
         use_prefill_pool = False
         prefill_slot = -1
+        cpu_expert_task = None
         num_tokens = topk_ids.size(0)
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
             is_mc = getattr(layer, 'enable_multi_card', False)
-            if is_mc:
+            # Hybrid execution owns this layer's placement.  Paging it would
+            # rewrite the very log2phy the CPU/NPU split is derived from, so
+            # the two halves could disagree about who owns a route.
+            hybrid_plan = None
+            if not is_mc:
+                from vllm_ascend.expert_offload.hybrid_executor import (
+                    maybe_prepare_hybrid_routes,
+                )
+
+                hybrid_plan = maybe_prepare_hybrid_routes(
+                    layer,
+                    hidden_states=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    log2phy=log2phy,
+                    max_tokens=mgr.offload_threshold,
+                )
+            if hybrid_plan is not None:
+                topk_ids = hybrid_plan.npu_topk_ids
+                topk_weights = hybrid_plan.npu_topk_weights
+                cpu_expert_task = hybrid_plan.cpu_task
+            elif is_mc:
                 mgr.update_weights_multi_card(
                     layer, topk_ids, log2phy, topk_weights,
                     hidden_states=x, mc2_mask=mc2_mask,
@@ -767,6 +789,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 td.num_local_experts = _saved_td["num_local_experts"]
                 td.local_expert_indices = _saved_td["local_expert_indices"]
                 td.expert_ids_per_ep_rank = _saved_td["expert_ids_per_ep_rank"]
+        if cpu_expert_task is not None:
+            final_hidden_states.cpu_expert_task = cpu_expert_task
         return final_hidden_states
 
     def process_scale(self, weight: torch.Tensor, scale, per_group_scale):

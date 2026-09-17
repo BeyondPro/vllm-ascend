@@ -298,6 +298,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
         prefill_slot = -1
+        cpu_expert_task = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -306,7 +307,28 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 getattr(layer, "enable_multi_card", False)
                 and _EXTRA_CTX.moe_comm_type == MoECommType.MC2
             )
-            if is_multi_card_decode:
+            # Hybrid execution owns this layer's placement.  Paging it would
+            # rewrite the very log2phy the CPU/NPU split is derived from, so
+            # the two halves could disagree about who owns a route.
+            hybrid_plan = None
+            if not is_multi_card_decode:
+                from vllm_ascend.expert_offload.hybrid_executor import (
+                    maybe_prepare_hybrid_routes,
+                )
+
+                hybrid_plan = maybe_prepare_hybrid_routes(
+                    layer,
+                    hidden_states=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    log2phy=log2phy,
+                    max_tokens=mgr.offload_threshold,
+                )
+            if hybrid_plan is not None:
+                topk_ids = hybrid_plan.npu_topk_ids
+                topk_weights = hybrid_plan.npu_topk_weights
+                cpu_expert_task = hybrid_plan.cpu_task
+            elif is_multi_card_decode:
                 mgr.update_weights_multi_card(
                     layer, topk_ids, log2phy, topk_weights,
                     hidden_states=x, mc2_mask=mc2_mask,
@@ -427,6 +449,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.moe_config.num_local_experts = _saved_nle
             layer.local_num_experts = _saved_lne
             moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
+        if cpu_expert_task is not None:
+            final_hidden_states.cpu_expert_task = cpu_expert_task
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

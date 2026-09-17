@@ -240,6 +240,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         # multi-card prefill loads this rank's EP shard into the prefill pool.
         use_prefill_pool = False
         prefill_slot = -1
+        cpu_expert_task = None
         num_tokens = topk_ids.size(0)
         enable_expert_offload = getattr(layer, "enable_expert_offload", False)
         forward_context = get_forward_context()
@@ -265,19 +266,40 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 )
                 prefill_regime = forward_context.moe_comm_type != MoECommType.MC2
             else:
-                mgr.update_weights(
-                    layer,
-                    topk_ids,
-                    log2phy,
-                    topk_weights,
-                    hidden_states=x,
-                    router_logits=router_logits,
-                    renormalize=renormalize,
-                    scoring_func=scoring_func,
-                    e_score_correction_bias=e_score_correction_bias,
-                    routed_scaling_factor=routed_scaling_factor,
-                    is_hash_routed=tid2eid is not None,
+                # A concrete CPU kernel integration attaches an executor to
+                # the routed-expert layer after its CPU weights are ready.
+                # Hybrid execution is deliberately limited to single-card
+                # decode; prefill retains the existing layerwise NPU pool.
+                from vllm_ascend.expert_offload.hybrid_executor import (
+                    maybe_prepare_hybrid_routes,
                 )
+
+                hybrid_plan = maybe_prepare_hybrid_routes(
+                    layer,
+                    hidden_states=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    log2phy=log2phy,
+                    max_tokens=mgr.offload_threshold,
+                )
+                if hybrid_plan is not None:
+                    topk_ids = hybrid_plan.npu_topk_ids
+                    topk_weights = hybrid_plan.npu_topk_weights
+                    cpu_expert_task = hybrid_plan.cpu_task
+                else:
+                    mgr.update_weights(
+                        layer,
+                        topk_ids,
+                        log2phy,
+                        topk_weights,
+                        hidden_states=x,
+                        router_logits=router_logits,
+                        renormalize=renormalize,
+                        scoring_func=scoring_func,
+                        e_score_correction_bias=e_score_correction_bias,
+                        routed_scaling_factor=routed_scaling_factor,
+                        is_hash_routed=tid2eid is not None,
+                    )
                 prefill_regime = num_tokens > mgr.offload_threshold
 
             if (
@@ -392,6 +414,8 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                     token_dispatcher.local_expert_indices = _saved_dispatcher_state["local_expert_indices"]
                     token_dispatcher.expert_ids_per_ep_rank = _saved_dispatcher_state["expert_ids_per_ep_rank"]
 
+        if cpu_expert_task is not None:
+            final_hidden_states.cpu_expert_task = cpu_expert_task
         if enable_expert_offload:
             mgr.log_exclusive_sharded_numeric(
                 layer, final_hidden_states.routed_out, "moe_output")

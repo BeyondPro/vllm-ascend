@@ -76,6 +76,10 @@ def set_gmmswigluquant_method():
 @dataclass
 class FusedExpertsResult:
     routed_out: torch.Tensor
+    # Optional CPU routed-expert work submitted by a hybrid expert executor.
+    # The runner merges it after token_combine and before finalize so CPU and
+    # NPU outputs share the same padding and communication finalization.
+    cpu_expert_task: object | None = None
     # This field is for shared experts and should be set by the MoE
     # communication method that supports shared experts in parallel with routed
     # experts.
