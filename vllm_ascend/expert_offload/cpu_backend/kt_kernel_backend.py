@@ -23,10 +23,36 @@ which is which.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
+
+
+def _eager_trace(event: str, **fields: Any) -> None:
+    path = os.environ.get("VLLM_ASCEND_CPU_MOE_TRACE")
+    if not path:
+        return
+    # ts_ns is CLOCK_MONOTONIC: durations stay correct if the wall clock is
+    # stepped. wall_ns is CLOCK_REALTIME: it shares its epoch with the Ascend
+    # profiler, so the spans can be placed on that timeline.
+    record = {
+        "event": event,
+        "ts_ns": time.perf_counter_ns(),
+        "wall_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "tid": threading.get_native_id(),
+    }
+    record.update(fields)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,9 +215,12 @@ class _KtKernelExpertTask:
         self._result: torch.Tensor | None = None
         self._error: BaseException | None = None
         self._finished = False
+        self._created_ns = time.perf_counter_ns()
 
     def wait(self) -> torch.Tensor:
         if not self._finished:
+            sync_begin = time.perf_counter_ns()
+            _eager_trace("cpu_moe.sync_begin", layer=self._backend.config.layer_idx, task_created_ns=self._created_ns, wait_queue_ns=sync_begin - self._created_ns)
             try:
                 self._result = self._backend._wrapper.sync_forward(
                     self._hidden_states, self._stream_handle)
@@ -199,6 +228,8 @@ class _KtKernelExpertTask:
                 self._error = exc
                 raise
             finally:
+                sync_end = time.perf_counter_ns()
+                _eager_trace("cpu_moe.sync_end", layer=self._backend.config.layer_idx, sync_duration_ns=sync_end - sync_begin, total_task_ns=sync_end - self._created_ns)
                 self._finished = True
                 self._backend._task_finished(self)
         if self._error is not None:
@@ -391,8 +422,19 @@ class KtKernelCPUExpertBackend:
             return self._submit_graph(hidden_states, topk_ids, topk_weights)
 
         stream_handle = self._stream_handle_provider(hidden_states.device)
+        submit_begin = time.perf_counter_ns()
         self._wrapper.submit_forward(hidden_states, topk_ids, topk_weights,
                                      stream_handle)
+        submit_end = time.perf_counter_ns()
+        try:
+            expert_ids = sorted({int(x) for x in topk_ids.detach().cpu().reshape(-1) if int(x) >= 0})
+        except Exception:
+            expert_ids = []
+        try:
+            affinity = sorted(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            affinity = None
+        _eager_trace("cpu_moe.submit_end", layer=layer_idx, tokens=num_tokens, experts=expert_ids, submit_duration_ns=submit_end-submit_begin, cpu_affinity=affinity, stream_handle=stream_handle)
         task = _KtKernelExpertTask(self, hidden_states, stream_handle)
         self._in_flight = task
         return task
