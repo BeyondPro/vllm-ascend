@@ -55,6 +55,19 @@ def _eager_trace(event: str, **fields: Any) -> None:
         pass
 
 
+def _cpu_affinity() -> list[int] | None:
+    """CPUs the calling thread may run on, or None where the OS will not say."""
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
+
+
+def _distinct_ids(ids: torch.Tensor) -> list[int]:
+    """Sorted distinct non-negative expert ids in a routed-id tensor."""
+    return sorted({int(x) for x in ids.reshape(-1) if int(x) >= 0})
+
+
 @dataclass(frozen=True, slots=True)
 class KtKernelBackendConfig:
     """Immutable construction parameters for one CPU MoE layer."""
@@ -327,6 +340,9 @@ class KtKernelCPUExpertBackend:
         self._in_flight: (_KtKernelExpertTask
                           | _KtKernelGraphExpertTask | None) = None
         self._graph_methods_checked = False
+        # Set by ``_submit_graph`` at capture and read by the join half, which
+        # has no task object of its own to carry the timestamp.
+        self._graph_task_created_ns: int | None = None
 
         self._wrapper = wrapper_factory(
             layer_idx=config.layer_idx,
@@ -427,14 +443,10 @@ class KtKernelCPUExpertBackend:
                                      stream_handle)
         submit_end = time.perf_counter_ns()
         try:
-            expert_ids = sorted({int(x) for x in topk_ids.detach().cpu().reshape(-1) if int(x) >= 0})
+            expert_ids = _distinct_ids(topk_ids.detach().cpu())
         except Exception:
             expert_ids = []
-        try:
-            affinity = sorted(os.sched_getaffinity(0))
-        except (AttributeError, OSError):
-            affinity = None
-        _eager_trace("cpu_moe.submit_end", layer=layer_idx, tokens=num_tokens, experts=expert_ids, submit_duration_ns=submit_end-submit_begin, cpu_affinity=affinity, stream_handle=stream_handle)
+        _eager_trace("cpu_moe.submit_end", layer=layer_idx, tokens=num_tokens, experts=expert_ids, submit_duration_ns=submit_end-submit_begin, cpu_affinity=_cpu_affinity(), stream_handle=stream_handle)
         task = _KtKernelExpertTask(self, hidden_states, stream_handle)
         self._in_flight = task
         return task
@@ -473,7 +485,9 @@ class KtKernelCPUExpertBackend:
             self._launch_pinned_forward,
             (hidden_states, int(stream.npu_stream)),
         )
+        task_created_ns = time.perf_counter_ns()
         task = _KtKernelGraphExpertTask(self, hidden_states, stream)
+        self._graph_task_created_ns = task_created_ns
         self._in_flight = task
         return task
 
@@ -491,7 +505,33 @@ class KtKernelCPUExpertBackend:
         split exists to remove.
         """
         hidden_states, stream_handle = args
+        submit_begin = time.perf_counter_ns()
         self._wrapper.forward_on_pinned_buffers(hidden_states, stream_handle)
+        submit_end = time.perf_counter_ns()
+        try:
+            expert_ids = self._pinned_expert_ids(hidden_states)
+        except Exception:
+            expert_ids = []
+        _eager_trace("cpu_moe.submit_end", layer=self.config.layer_idx, tokens=int(hidden_states.view(-1, hidden_states.shape[-1]).shape[0]), experts=expert_ids, submit_duration_ns=submit_end-submit_begin, cpu_affinity=_cpu_affinity(), stream_handle=stream_handle)
+
+    def _pinned_expert_ids(self, hidden_states: torch.Tensor) -> list[int]:
+        """Distinct CPU expert ids this layer routed to, read on the host.
+
+        Graph mode has no Python frame holding ``topk_ids``: the ids reach the
+        CPU only through the D2H that ``copy_inputs_to_cpu_buffers`` records
+        into kt-kernel's pinned buffers, and that op re-runs on every replay
+        rather than at capture.  By the time the submit callback fires the copy
+        has landed, so the ids can be read straight out of the buffer -- and
+        reading beats copying them down again, which a capture would reject
+        anyway.
+        """
+        from kt_kernel.experts_base import KExpertsCPUBuffer
+
+        flat = hidden_states.view(-1, hidden_states.shape[-1])
+        _, immediate_ids_cpu, _, _, _, _, _ = KExpertsCPUBuffer.get_buffer(
+            flat, self.config.top_k)
+        slot = self.config.layer_idx % KExpertsCPUBuffer.buffer_depth
+        return _distinct_ids(immediate_ids_cpu[slot])
 
     def _drain_pinned_forward(self, _user_data: None) -> None:
         """Join half: block until this layer's CPU MoE has finished.
@@ -500,7 +540,11 @@ class KtKernelCPUExpertBackend:
         carrying the captured H2D of ``output_cpu`` is ordered behind a
         finished buffer rather than a half-written one.
         """
+        sync_begin = time.perf_counter_ns()
         self._wrapper.drain_pinned_forward()
+        sync_end = time.perf_counter_ns()
+        created = self._graph_task_created_ns
+        _eager_trace("cpu_moe.sync_end", layer=self.config.layer_idx, sync_duration_ns=sync_end-sync_begin, total_task_ns=sync_end-created if created is not None else None)
 
     def _join_pinned_forward(self, stream) -> None:
         """Register the join half, or run it inline when no capture is active.
