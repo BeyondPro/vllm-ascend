@@ -3,17 +3,12 @@
 This adapter reuses ktransformers' pinned buffers, CPUInfer worker pool, and
 GGUF/LLAMAFILE MoE implementation.  Two execution modes are supported:
 
-* **eager** -- ``submit`` blocks the host thread into kt-kernel's WorkerPool
-  and ``wait`` drains it.  Correct, and the only mode that allows CPU/NPU
-  overlap today.
-* **graph** -- during ACL graph capture the layer is recorded as a *pair* of
-  stream host callbacks around kt-kernel's pinned buffers: a submit half that
-  enqueues the CPU MoE as soon as the inputs have been copied down, and a join
-  half that waits for it at the point the result is first needed.  The input
-  D2H and the output H2D are ordinary device ops, so like the callbacks they
-  re-run on every replay.  Splitting submit from join is what makes the CPU
-  MoE overlap: the NPU work captured between the two halves runs concurrently
-  with the WorkerPool instead of stalling behind it.
+* **eager** -- submit stages inputs and queues CPU work; wait drains the
+  worker pool and copies the output back to the device.
+* **graph** -- a shared per-device CPU communication stream waits for input readiness,
+  records D2H, submit and drain host callbacks, then H2D and output readiness.
+  The compute stream runs NPU experts concurrently and joins the output event
+  only where the CPU result is consumed. All dependencies replay with the graph.
 
 The mode is chosen per call from whether the current stream is being captured,
 so one backend serves a warmup, a capture, and every replay without being told
@@ -141,6 +136,26 @@ _GRAPH_BATCH_SIGNATURES: dict[int, tuple[int, int, torch.dtype, str, int | None]
 # torch's stream equality semantics.
 _SUBSCRIBED_STREAM_IDS: set[int] = set()
 
+# One CPU communication stream per process/device, shared by all layer backends.
+# Each layer still owns its capture events and task/buffer references.
+_CPU_GRAPH_STREAMS: dict[int, Any] = {}
+_CPU_GRAPH_STREAMS_LOCK = threading.Lock()
+
+
+def _shared_cpu_graph_stream(device: torch.device):
+    if device.type != "npu":
+        raise ValueError("CPU graph communication requires an NPU device")
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.npu.current_device()
+    with _CPU_GRAPH_STREAMS_LOCK:
+        stream = _CPU_GRAPH_STREAMS.get(device_index)
+        if stream is None:
+            stream = torch.npu.Stream(device=device_index)
+            _CPU_GRAPH_STREAMS[device_index] = stream
+        return stream
+
+
 # Methods the wrapper must expose for the graph path.  Checked when a capture
 # first asks for them rather than at construction, so an older kt-kernel build
 # keeps working for eager decode.
@@ -254,35 +269,33 @@ class _KtKernelExpertTask:
 
 
 class _KtKernelGraphExpertTask:
-    """One in-flight call whose CPU work runs in ACL stream host callbacks.
+    """A graph task with CPU callbacks and transfers on a separate stream.
 
-    The layer is recorded as a *pair* of callbacks.  The submit half fires once
-    the inputs have been copied down and returns immediately; the join half
-    fires where the result is first needed and waits there.  Everything the
-    NPU executes in between overlaps the CPU MoE.
-
-    ``wait`` registers the join half and then issues the device-side H2D of
-    kt-kernel's pinned output buffer.  The stream orders that copy behind the
-    join callback, so it cannot read a half-written ``output_cpu`` -- the join
-    is what does the synchronising, not a side stream or an explicit event.
+    Input readiness forks the CPU branch from the compute stream. Both host
+    callbacks and output H2D run on the CPU branch; wait only joins its output
+    readiness back into the compute stream before the routed results merge.
     """
 
     def __init__(self, backend: "KtKernelCPUExpertBackend",
-                 hidden_states: torch.Tensor, stream) -> None:
+                 hidden_states: torch.Tensor, stream, output_ready,
+                 result: torch.Tensor, inputs_ready) -> None:
         self._backend = backend
         self._hidden_states = hidden_states
         self._stream = stream
-        self._result: torch.Tensor | None = None
+        # Retain events and buffers for the capture/replay lifetime.
+        self._output_ready = output_ready
+        self._inputs_ready = inputs_ready
+        self._result: torch.Tensor | None = result
         self._error: BaseException | None = None
         self._finished = False
 
     def wait(self) -> torch.Tensor:
         if not self._finished:
             try:
-                self._backend._join_pinned_forward(self._stream)
-                self._result = (
-                    self._backend._wrapper.copy_forward_output_to_device(
-                        self._hidden_states))
+                # A graph device dependency, not a host-side synchronize.
+                # 给主计算流添加设备依赖：消费 CPU 结果前，等通信流 H2D 完成。
+                # 不是让当前 Python 线程同步等待计算。
+                self._stream.wait_event(self._output_ready)
             except BaseException as exc:
                 self._error = exc
                 raise
@@ -340,6 +353,7 @@ class KtKernelCPUExpertBackend:
         self._in_flight: (_KtKernelExpertTask
                           | _KtKernelGraphExpertTask | None) = None
         self._graph_methods_checked = False
+        self._graph_tasks: list[_KtKernelGraphExpertTask] = []
         # Set by ``_submit_graph`` at capture and read by the join half, which
         # has no task object of its own to carry the timestamp.
         self._graph_task_created_ns: int | None = None
@@ -469,26 +483,45 @@ class KtKernelCPUExpertBackend:
         self._require_graph_methods()
         self._pin_graph_batch_size(hidden_states)
 
-        # D2H into kt-kernel's pinned buffers.  An ordinary device op, so it is
-        # recorded into the graph and re-runs on every replay.
-        self._wrapper.copy_inputs_to_cpu_buffers(hidden_states, topk_ids,
-                                                 topk_weights)
-
         import torch_npu
 
+        # 旧版：D2H -> 提交回调 -> NPU 专家 -> 等待回调 -> H2D，都在主计算流。
+        # 现在：主计算流算 NPU 专家；共享通信流负责 D2H、两个回调和 H2D。
+        # 此处捕获图，记录执行顺序；两个回调在每次 replay 时执行。
         stream = _current_stream(hidden_states.device)
-        _ensure_subscribed(stream)
-        # Submit half.  It only enqueues, so the NPU work captured after this
-        # point runs while the WorkerPool chews on the layer.
-        torch_npu.npu._launch_host_func(
-            stream,
-            self._launch_pinned_forward,
-            (hidden_states, int(stream.npu_stream)),
-        )
-        task_created_ns = time.perf_counter_ns()
-        task = _KtKernelGraphExpertTask(self, hidden_states, stream)
-        self._graph_task_created_ns = task_created_ns
+        cpu_stream = _shared_cpu_graph_stream(hidden_states.device)
+        inputs_ready = torch.npu.Event()
+        output_ready = torch.npu.Event()
+        # 输入及路由就绪后记录事件，通信流等此事件才开始拷贝。
+        # with 切换后续设备操作的入队流，本身不会新建 Python 线程。
+        stream.record_event(inputs_ready)
+        with torch.npu.stream(cpu_stream):
+            # Fork after routing/input production; compute stream can proceed
+            # directly to NPU experts without waiting for either host callback.
+            cpu_stream.wait_event(inputs_ready)
+            # D2H：把 hidden states、专家 ID 和权重拷到 CPU 缓冲区。
+            self._wrapper.copy_inputs_to_cpu_buffers(hidden_states, topk_ids,
+                                                     topk_weights)
+            _ensure_subscribed(cpu_stream)
+            # 前面的 D2H 完成后，运行时的 CPU 回调线程才执行提交函数。
+            # 提交只把 CPU 任务入队，不等待整层计算完成。
+            torch_npu.npu._launch_host_func(
+                cpu_stream, self._launch_pinned_forward,
+                (hidden_states, int(cpu_stream.npu_stream)),
+            )
+            # Record drain immediately on the CPU branch, rather than after
+            # NPU expert execution. H2D starts as soon as CPU output is ready.
+            # 第二个回调等 CPU 完成；通信流等待时，主计算流可继续算 NPU 专家。
+            self._join_pinned_forward(cpu_stream)
+            # H2D：CPU 结果可用就传回设备，不依赖 NPU 专家先算完。
+            result = self._wrapper.copy_forward_output_to_device(hidden_states)
+            # 此事件在 H2D 之后，表示结果已经传到设备。
+            cpu_stream.record_event(output_ready)
+        task = _KtKernelGraphExpertTask(
+            self, hidden_states, stream, output_ready, result, inputs_ready)
+        self._graph_task_created_ns = time.perf_counter_ns()
         self._in_flight = task
+        self._graph_tasks.append(task)
         return task
 
     def _launch_pinned_forward(self, args: tuple[torch.Tensor, int]) -> None:
@@ -506,6 +539,8 @@ class KtKernelCPUExpertBackend:
         """
         hidden_states, stream_handle = args
         submit_begin = time.perf_counter_ns()
+        # Python -> C++ CPUInfer.submit -> MoE 入口 -> TaskQueue.enqueue。
+        # 队列后台线程执行 forward，再调度 CPU 计算线程池。
         self._wrapper.forward_on_pinned_buffers(hidden_states, stream_handle)
         submit_end = time.perf_counter_ns()
         try:
