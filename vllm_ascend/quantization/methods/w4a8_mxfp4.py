@@ -281,6 +281,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                     topk_weights=topk_weights,
                     log2phy=log2phy,
                     max_tokens=mgr.offload_threshold,
+                    transfer_manager=mgr,
                 )
                 if hybrid_plan is not None:
                     topk_ids = hybrid_plan.npu_topk_ids

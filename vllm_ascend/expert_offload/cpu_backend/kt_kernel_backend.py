@@ -7,6 +7,8 @@ GGUF/LLAMAFILE MoE implementation.  Two execution modes are supported:
   worker pool and copies the output back to the device.
 * **graph** -- a shared per-device CPU communication stream waits for input readiness,
   records D2H, submit and drain host callbacks, then H2D and output readiness.
+  Expert-transfer mode defers drain/output H2D until NPU work is recorded,
+  allowing the weight-loading callback to progress after CPU submission.
   The compute stream runs NPU experts concurrently and joins the output event
   only where the CPU result is consumed. All dependencies replay with the graph.
 
@@ -32,6 +34,10 @@ def _eager_trace(event: str, **fields: Any) -> None:
     path = os.environ.get("VLLM_ASCEND_CPU_MOE_TRACE")
     if not path:
         return
+    # Shared NFS writes can stall the runtime callback dispatcher. Keep
+    # diagnostics on the container's local temporary filesystem instead.
+    if os.path.abspath(path).startswith("/mnt/share/"):
+        path = f"/tmp/cpu_moe_trace_{os.getpid()}.jsonl"
     # ts_ns is CLOCK_MONOTONIC: durations stay correct if the wall clock is
     # stepped. wall_ns is CLOCK_REALTIME: it shares its epoch with the Ascend
     # profiler, so the spans can be placed on that timeline.
@@ -278,13 +284,17 @@ class _KtKernelGraphExpertTask:
 
     def __init__(self, backend: "KtKernelCPUExpertBackend",
                  hidden_states: torch.Tensor, stream, output_ready,
-                 result: torch.Tensor, inputs_ready) -> None:
+                 result: torch.Tensor | None, inputs_ready,
+                 cpu_stream=None, submitted_event=None) -> None:
         self._backend = backend
         self._hidden_states = hidden_states
         self._stream = stream
         # Retain events and buffers for the capture/replay lifetime.
         self._output_ready = output_ready
         self._inputs_ready = inputs_ready
+        self._cpu_stream = cpu_stream
+        self.submitted_event = submitted_event
+        self._npu_done = None
         self._result: torch.Tensor | None = result
         self._error: BaseException | None = None
         self._finished = False
@@ -292,6 +302,18 @@ class _KtKernelGraphExpertTask:
     def wait(self) -> torch.Tensor:
         if not self._finished:
             try:
+                if self._cpu_stream is not None:
+                    # In transfer mode a blocking join must not occupy the
+                    # callback dispatcher before the weight callback/NPU phase.
+                    # Record before waiting: safe on the first graph replay.
+                    self._npu_done = torch.npu.Event()
+                    self._stream.record_event(self._npu_done)
+                    with torch.npu.stream(self._cpu_stream):
+                        self._cpu_stream.wait_event(self._npu_done)
+                        self._backend._join_pinned_forward(self._cpu_stream)
+                        self._result = self._backend._wrapper.copy_forward_output_to_device(
+                            self._hidden_states)
+                        self._cpu_stream.record_event(self._output_ready)
                 # A graph device dependency, not a host-side synchronize.
                 # 给主计算流添加设备依赖：消费 CPU 结果前，等通信流 H2D 完成。
                 # 不是让当前 Python 线程同步等待计算。
@@ -400,6 +422,7 @@ class KtKernelCPUExpertBackend:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        defer_graph_join: bool = False,
     ):
         if layer_idx != self.config.layer_idx:
             raise ValueError(
@@ -449,7 +472,8 @@ class KtKernelCPUExpertBackend:
 
         hidden_states = hidden_states.contiguous()
         if _graph_capture_active():
-            return self._submit_graph(hidden_states, topk_ids, topk_weights)
+            return self._submit_graph(hidden_states, topk_ids, topk_weights,
+                                      defer_graph_join=defer_graph_join)
 
         stream_handle = self._stream_handle_provider(hidden_states.device)
         submit_begin = time.perf_counter_ns()
@@ -470,6 +494,8 @@ class KtKernelCPUExpertBackend:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        *,
+        defer_graph_join: bool = False,
     ) -> _KtKernelGraphExpertTask:
         """Record this layer's CPU MoE into the graph being captured.
 
@@ -492,6 +518,7 @@ class KtKernelCPUExpertBackend:
         cpu_stream = _shared_cpu_graph_stream(hidden_states.device)
         inputs_ready = torch.npu.Event()
         output_ready = torch.npu.Event()
+        submitted_event = torch.npu.Event() if defer_graph_join else None
         # 输入及路由就绪后记录事件，通信流等此事件才开始拷贝。
         # with 切换后续设备操作的入队流，本身不会新建 Python 线程。
         stream.record_event(inputs_ready)
@@ -509,16 +536,20 @@ class KtKernelCPUExpertBackend:
                 cpu_stream, self._launch_pinned_forward,
                 (hidden_states, int(cpu_stream.npu_stream)),
             )
-            # Record drain immediately on the CPU branch, rather than after
-            # NPU expert execution. H2D starts as soon as CPU output is ready.
-            # 第二个回调等 CPU 完成；通信流等待时，主计算流可继续算 NPU 专家。
-            self._join_pinned_forward(cpu_stream)
-            # H2D：CPU 结果可用就传回设备，不依赖 NPU 专家先算完。
-            result = self._wrapper.copy_forward_output_to_device(hidden_states)
-            # 此事件在 H2D 之后，表示结果已经传到设备。
-            cpu_stream.record_event(output_ready)
+            if defer_graph_join:
+                # Nonblocking CPU submission completes before main-stream H2D.
+                # wait() will record drain/output H2D after NPU computation.
+                cpu_stream.record_event(submitted_event)
+                result = None
+            else:
+                # Preserve the original CPU-only path: return results ASAP.
+                self._join_pinned_forward(cpu_stream)
+                result = self._wrapper.copy_forward_output_to_device(hidden_states)
+                cpu_stream.record_event(output_ready)
         task = _KtKernelGraphExpertTask(
-            self, hidden_states, stream, output_ready, result, inputs_ready)
+            self, hidden_states, stream, output_ready, result, inputs_ready,
+            cpu_stream=cpu_stream if defer_graph_join else None,
+            submitted_event=submitted_event)
         self._graph_task_created_ns = time.perf_counter_ns()
         self._in_flight = task
         self._graph_tasks.append(task)
@@ -539,6 +570,7 @@ class KtKernelCPUExpertBackend:
         """
         hidden_states, stream_handle = args
         submit_begin = time.perf_counter_ns()
+        callback_begin_wall_ns = time.time_ns()
         # Python -> C++ CPUInfer.submit -> MoE 入口 -> TaskQueue.enqueue。
         # 队列后台线程执行 forward，再调度 CPU 计算线程池。
         self._wrapper.forward_on_pinned_buffers(hidden_states, stream_handle)
@@ -547,7 +579,8 @@ class KtKernelCPUExpertBackend:
             expert_ids = self._pinned_expert_ids(hidden_states)
         except Exception:
             expert_ids = []
-        _eager_trace("cpu_moe.submit_end", layer=self.config.layer_idx, tokens=int(hidden_states.view(-1, hidden_states.shape[-1]).shape[0]), experts=expert_ids, submit_duration_ns=submit_end-submit_begin, cpu_affinity=_cpu_affinity(), stream_handle=stream_handle)
+        metadata_end = time.perf_counter_ns()
+        _eager_trace("cpu_moe.submit_end", layer=self.config.layer_idx, tokens=int(hidden_states.view(-1, hidden_states.shape[-1]).shape[0]), experts=expert_ids, submit_duration_ns=submit_end-submit_begin, callback_begin_ns=submit_begin, callback_begin_wall_ns=callback_begin_wall_ns, submit_end_ns=submit_end, metadata_end_ns=metadata_end, metadata_duration_ns=metadata_end-submit_end, cpu_affinity=_cpu_affinity(), stream_handle=stream_handle)
 
     def _pinned_expert_ids(self, hidden_states: torch.Tensor) -> list[int]:
         """Distinct CPU expert ids this layer routed to, read on the host.

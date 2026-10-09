@@ -42,6 +42,7 @@ class CPUExpertBackend(Protocol):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        defer_graph_join: bool = False,
     ) -> CPUExpertTask:
         """Submit the CPU-owned routes without blocking NPU execution.
 
@@ -49,6 +50,9 @@ class CPUExpertBackend(Protocol):
         for routes owned by NPU.  The backend must skip negative ids.  It owns
         any D2H transfer and must apply each non-zero routing weight exactly
         once before reducing expert outputs into token-major order.
+        With ``defer_graph_join``, submit records a submission event but leaves
+        graph drain/output copies to wait(), after NPU work has been recorded.
+        This must never defer the CPU computation itself.
         """
         ...
 
@@ -74,6 +78,7 @@ class HybridExpertExecutor:
             raise ValueError(f"layer_idx must be non-negative; got {layer_idx}")
         self.backend = backend
         self.layer_idx = layer_idx
+        self._weight_transfer = None
 
     def prepare(
         self,
@@ -82,6 +87,7 @@ class HybridExpertExecutor:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         log2phy: torch.Tensor,
+        weight_transfer=None,
     ) -> HybridExpertPlan:
         """Submit CPU misses and produce a safe zero-weight NPU route.
 
@@ -102,6 +108,10 @@ class HybridExpertExecutor:
             raise ValueError(
                 f"log2phy must be rank 1; got rank={log2phy.ndim}")
 
+        # Decide placement before splitting, then submit CPU work before
+        # loading weights. The promoted routes must only run on NPU.
+        transfer_task = (weight_transfer.prepare(topk_ids, log2phy)
+                         if weight_transfer is not None else None)
         physical_ids = log2phy[topk_ids]
         npu_route_mask = physical_ids >= 0
         zero = torch.zeros((), dtype=topk_weights.dtype,
@@ -122,12 +132,18 @@ class HybridExpertExecutor:
             topk_ids,
         )
 
+        submission_options = {}
+        if transfer_task is not None and transfer_task.graph:
+            submission_options["defer_graph_join"] = True
         cpu_task = self.backend.submit(
             layer_idx=self.layer_idx,
             hidden_states=hidden_states,
             topk_ids=cpu_topk_ids,
             topk_weights=cpu_topk_weights,
+            **submission_options,
         )
+        if transfer_task is not None:
+            transfer_task.wait_for_weights(cpu_task)
         return HybridExpertPlan(
             npu_topk_ids=topk_ids,
             npu_topk_weights=npu_topk_weights,
@@ -166,6 +182,7 @@ def maybe_prepare_hybrid_routes(
     topk_weights: torch.Tensor,
     log2phy: torch.Tensor,
     max_tokens: int | None = None,
+    transfer_manager=None,
 ) -> HybridExpertPlan | None:
     """Split this layer's routes onto CPU and NPU, if a backend owns it.
 
@@ -190,11 +207,22 @@ def maybe_prepare_hybrid_routes(
         effective_max_tokens = min(max_tokens, backend_max_tokens)
     if topk_ids.shape[0] > effective_max_tokens:
         return None
+    weight_transfer = None
+    if (transfer_manager is not None
+            and transfer_manager.offload_config.cpu_moe.transfer_one_expert):
+        if executor._weight_transfer is None:
+            from vllm_ascend.expert_offload.hybrid_transfer import (
+                HybridExpertTransfer,
+            )
+            executor._weight_transfer = HybridExpertTransfer(
+                transfer_manager, layer)
+        weight_transfer = executor._weight_transfer
     return executor.prepare(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         log2phy=log2phy,
+        weight_transfer=weight_transfer,
     )
 
 

@@ -971,6 +971,9 @@ class CpuMoeConfig:
         "threadpool_count": 1,
         "max_num_tokens": 1,
         "numa_nodes": None,
+        # When more than four distinct routed experts miss NPU residency,
+        # transfer exactly one to NPU while the CPU computes the remainder.
+        "transfer_one_expert": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1058,6 +1061,8 @@ class CpuMoeConfig:
     def _validate_config(self):
         if not isinstance(self.config["enabled"], bool):
             raise TypeError("cpu_moe.enabled must be a boolean")
+        if not isinstance(self.config["transfer_one_expert"], bool):
+            raise TypeError("cpu_moe.transfer_one_expert must be a boolean")
         if self.config["backend"] not in ("kt_kernel", ):
             raise ValueError("cpu_moe.backend must be 'kt_kernel'; got "
                              f"{self.config['backend']!r}")
